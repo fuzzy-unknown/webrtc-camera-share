@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>发送端</title>
+  <style>
+    * {
+      margin: 0;
+      box-sizing: border-box
+    }
+
+    body {
+      background: #111;
+      color: #fff;
+      font-family: system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100dvh;
+      padding: 16px;
+      gap: 16px
+    }
+
+    h2 {
+      font-size: 16px;
+      font-weight: 500
+    }
+
+    video {
+      width: 100%;
+      max-width: 640px;
+      aspect-ratio: 16 / 9;
+      border-radius: 8px;
+      background: #000;
+      object-fit: cover
+    }
+
+    p {
+      font-size: 13px;
+      color: #888;
+      text-align: center
+    }
+
+    .btns {
+      display: flex;
+      gap: 12px
+    }
+
+    button {
+      padding: 12px 32px;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer
+    }
+
+    .start {
+      background: #07C160;
+      color: #fff
+    }
+
+    .stop {
+      background: #FF3B30;
+      color: #fff
+    }
+
+    @media (max-width: 640px) {
+      body {
+        padding: env(safe-area-inset-top, 12px) 12px env(safe-area-inset-bottom, 12px)
+      }
+
+      h2 {
+        font-size: 14px
+      }
+
+      video {
+        max-width: 100%;
+        border-radius: 6px
+      }
+
+      button {
+        padding: 14px 40px;
+        font-size: 16px
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <h2>发送端</h2>
+  <video id="preview" autoplay playsinline muted></video>
+  <p id="status">点击按钮开启摄像头并发送</p>
+  <button class="start" id="startBtn">开始</button>
+  <button class="stop" id="stopBtn" style="display:none">停止</button>
+
+  <script>
+    const preview = document.getElementById("preview");
+    const status = document.getElementById("status");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+
+    let pc = null, ws = null, localStream = null;
+    let iceCandidatesQueue = [];
+
+    function createPC() {
+      pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+          { urls: "stun:stun.services.mozilla.com" }
+        ]
+      });
+      pc.onicecandidate = (e) => {
+        if (e.candidate && ws?.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({ ice: e.candidate }));
+      };
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        status.textContent = state;
+        if (state === "failed" || state === "closed") {
+          cleanup();
+          status.textContent = "连接失败，请重新开始";
+        }
+      };
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        if (state === "failed") status.textContent = "ICE 连接失败";
+        if (state === "disconnected") status.textContent = "ICE 已断开";
+      };
+    }
+
+    async function processIceCandidates() {
+      if (!pc.remoteDescription) return;
+      while (iceCandidatesQueue.length > 0) {
+        const candidate = iceCandidatesQueue.shift();
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.warn("Failed to add ICE candidate:", err);
+        }
+      }
+    }
+
+    function cleanup() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+      localStream?.getTracks().forEach(t => t.stop());
+      pc?.close();
+      localStream = pc = ws = null;
+      iceCandidatesQueue = [];
+      preview.srcObject = null;
+      startBtn.style.display = "";
+      stopBtn.style.display = "none";
+      status.textContent = "已停止";
+    }
+
+    startBtn.onclick = async () => {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        });
+        preview.srcObject = localStream;
+        await preview.play();
+
+        createPC();
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(proto + "//" + location.host + "/ws?role=send");
+
+        ws.onopen = async () => {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          ws.send(JSON.stringify({ sdp: offer }));
+          status.textContent = "已发送 offer，等待接收端...";
+        };
+
+        ws.onmessage = async (e) => {
+          let data;
+          try { data = JSON.parse(e.data); } catch { return; }
+          if (data.sdp?.type === "answer") {
+            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            await processIceCandidates();
+            status.textContent = "连接建立";
+          } else if (data.ice) {
+            iceCandidatesQueue.push(data.ice);
+            await processIceCandidates();
+          }
+        };
+
+        ws.onerror = () => { status.textContent = "WebSocket 连接错误"; };
+        startBtn.style.display = "none";
+        stopBtn.style.display = "";
+        status.textContent = "正在连接...";
+      } catch (err) {
+        console.error("Error:", err);
+        if (err.name === "NotAllowedError") {
+          status.textContent = "摄像头权限被拒绝";
+        } else if (err.name === "NotFoundError") {
+          status.textContent = "未找到摄像头设备";
+        } else {
+          status.textContent = "错误：" + err.message;
+        }
+      }
+    };
+
+    stopBtn.onclick = cleanup;
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>接收端</title>
+  <style>
+    * {
+      margin: 0;
+      box-sizing: border-box
+    }
+
+    body {
+      background: #111;
+      color: #fff;
+      font-family: system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100dvh;
+      padding: 16px;
+      gap: 16px
+    }
+
+    h2 {
+      font-size: 16px;
+      font-weight: 500
+    }
+
+    video {
+      width: 100%;
+      max-width: 640px;
+      aspect-ratio: 16 / 9;
+      border-radius: 8px;
+      background: #000;
+      object-fit: cover
+    }
+
+    p {
+      font-size: 13px;
+      color: #888;
+      text-align: center
+    }
+
+    .btns {
+      display: flex;
+      gap: 12px
+    }
+
+    button {
+      padding: 12px 32px;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer
+    }
+
+    .start {
+      background: #07C160;
+      color: #fff
+    }
+
+    .stop {
+      background: #FF3B30;
+      color: #fff
+    }
+
+    @media (max-width: 640px) {
+      body {
+        padding: env(safe-area-inset-top, 12px) 12px env(safe-area-inset-bottom, 12px)
+      }
+
+      h2 {
+        font-size: 14px
+      }
+
+      video {
+        max-width: 100%;
+        border-radius: 6px
+      }
+
+      button {
+        padding: 14px 40px;
+        font-size: 16px
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <h2>接收端</h2>
+  <video id="remoteVideo" autoplay playsinline></video>
+  <p id="status">点击按钮接收视频流</p>
+  <button class="start" id="startBtn">开始</button>
+  <button class="stop" id="stopBtn" style="display:none">停止</button>
+
+  <script>
+    const remoteVideo = document.getElementById("remoteVideo");
+    const status = document.getElementById("status");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+
+    let pc = null, ws = null;
+    let iceCandidatesQueue = [];
+
+    function createPC() {
+      pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+          { urls: "stun:stun.services.mozilla.com" }
+        ]
+      });
+      pc.onicecandidate = (e) => {
+        if (e.candidate && ws?.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({ ice: e.candidate }));
+      };
+      pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        status.textContent = state;
+        if (state === "connected" || state === "completed") {
+          remoteVideo.muted = false;
+        }
+        if (state === "failed" || state === "closed") {
+          cleanup();
+          status.textContent = "连接失败，请重新开始";
+        }
+      };
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        if (state === "failed") status.textContent = "ICE 连接失败";
+        if (state === "disconnected") status.textContent = "ICE 已断开";
+      };
+      pc.ontrack = (e) => {
+        remoteVideo.srcObject = e.streams[0];
+        status.textContent = "收到视频流";
+      };
+    }
+
+    async function processIceCandidates() {
+      if (!pc.remoteDescription) return;
+      while (iceCandidatesQueue.length > 0) {
+        const candidate = iceCandidatesQueue.shift();
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.warn("Failed to add ICE candidate:", err);
+        }
+      }
+    }
+
+    function cleanup() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+      pc?.close();
+      pc = ws = null;
+      iceCandidatesQueue = [];
+      remoteVideo.srcObject = null;
+      remoteVideo.muted = true;
+      startBtn.style.display = "";
+      stopBtn.style.display = "none";
+      status.textContent = "已停止";
+    }
+
+    startBtn.onclick = () => {
+      createPC();
+      pc.addTransceiver("video", { direction: "recvonly" });
+
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(proto + "//" + location.host + "/ws?role=recv");
+
+      ws.onopen = () => {
+        status.textContent = "已连接，等待发送端...";
+      };
+
+      ws.onmessage = async (e) => {
+        let data;
+        try { data = JSON.parse(e.data); } catch { return; }
+        if (data.sdp?.type === "offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({ sdp: answer }));
+          await processIceCandidates();
+          status.textContent = "已回复 answer";
+        } else if (data.ice) {
+          iceCandidatesQueue.push(data.ice);
+          await processIceCandidates();
+        }
+      };
+
+      ws.onerror = () => { status.textContent = "WebSocket 连接错误"; };
+      startBtn.style.display = "none";
+      stopBtn.style.display = "";
+      status.textContent = "正在连接...";
+    };
+
+    stopBtn.onclick = cleanup;
+  </script>
+</body>
+
+</html>

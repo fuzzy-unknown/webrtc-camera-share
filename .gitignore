@@ -1,0 +1,17 @@
+# 依赖
+node_modules/
+
+# 构建输出
+target/
+
+# 环境变量
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# SQLite
+torrents.db
+torrents.db-shm
+torrents.db-wal
